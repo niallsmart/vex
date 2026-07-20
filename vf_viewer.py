@@ -16,7 +16,7 @@ import sqlite3
 from datetime import datetime
 from html import escape, unescape
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 from flask import Flask, g, render_template_string, abort, redirect, Response, request, send_file, url_for
 
 app = Flask(__name__)
@@ -58,10 +58,12 @@ def query_db(query, args=(), one=False):
 
 def format_date(date_str):
     """Format ISO date string for display."""
-    if not date_str:
+    if not date_str or date_str.startswith('-'):
         return ''
     try:
         dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+        if dt.year <= 1:
+            return ''
         return dt.strftime('%b %d, %Y at %I:%M %p')
     except:
         return date_str
@@ -108,6 +110,12 @@ def resolve_forum_link(url, reference_date=None):
         if path_parts[2].isdigit():
             return archive_url(f'/discussion/comment/{path_parts[2]}')
         return None
+
+    if len(path_parts) >= 2 and path_parts[0] == 'profile':
+        local = f'/profile/{path_parts[1]}'
+        if len(path_parts) >= 3:
+            local = f'{local}/{path_parts[2]}'
+        return archive_url(local)
 
     if len(path_parts) >= 2 and path_parts[0] == 'discussion' and path_parts[1].isdigit():
         discussion_id = int(path_parts[1])
@@ -629,8 +637,9 @@ PROFILE_TEMPLATE = """
         {% if user.title or user.label %}
         <div class="profile-title">{{ user.title or user.label }}</div>
         {% endif %}
-        {% if user.date_inserted %}
-        <div class="profile-joined">Joined {{ user.date_inserted | format_date }}</div>
+        {% set joined_date = user.date_inserted | format_date %}
+        {% if joined_date %}
+        <div class="profile-joined">Joined {{ joined_date }}</div>
         {% endif %}
     </div>
 </section>
@@ -645,27 +654,6 @@ PROFILE_TEMPLATE = """
         <span>Comments</span>
     </div>
 </div>
-
-<section class="profile-activity">
-    <h2>Recent activity</h2>
-    {% if activity %}
-        {% for item in activity %}
-        <div class="activity-item">
-            {% if item.activity_type == 'discussion' %}
-            Started <a href="/discussion/{{ item.discussion_id }}">{{ item.discussion_name }}</a>
-            {% else %}
-            Commented on <a href="/discussion/comment/{{ item.item_id }}">{{ item.discussion_name }}</a>
-            {% endif %}
-            {% if item.category_name %} in {{ item.category_name }}{% endif %}
-            <div class="activity-meta">{{ item.date_inserted | format_date }}</div>
-        </div>
-        {% endfor %}
-    {% else %}
-        <div class="empty-state">
-            <p>No archived activity for this user.</p>
-        </div>
-    {% endif %}
-</section>
 """
 
 
@@ -717,51 +705,31 @@ def category(category_id):
     return base_template(f"{cat['name']} - Forum Archive", content)
 
 
-@app.route('/profile/<int:user_id>')
-@app.route('/profile/<int:user_id>/<username>')
+@app.route('/profile/<user_id>')
+@app.route('/profile/<user_id>/<username>')
 def profile(user_id, username=None):
-    """Show a user's public profile and recent archived activity."""
-    user = query_db("""
-        SELECT user_id, name, title, label, date_inserted,
-               count_discussions, count_comments
-        FROM users
-        WHERE user_id = ?
-    """, [user_id], one=True)
+    """Show a profile, resolving legacy name-only profile URLs as needed."""
+    if user_id.isdigit():
+        user = query_db("""
+            SELECT user_id, name, title, label, date_inserted,
+                   count_discussions, count_comments
+            FROM users
+            WHERE user_id = ?
+        """, [int(user_id)], one=True)
+    else:
+        user = query_db("""
+            SELECT user_id, name, title, label, date_inserted,
+                   count_discussions, count_comments
+            FROM users
+            WHERE name = ? COLLATE NOCASE
+        """, [unquote(user_id)], one=True)
+
     if not user:
         abort(404)
-
-    activity = query_db("""
-        SELECT 'discussion' AS activity_type,
-               d.discussion_id AS item_id,
-               d.discussion_id,
-               d.name AS discussion_name,
-               cat.name AS category_name,
-               d.date_inserted
-        FROM discussions d
-        LEFT JOIN categories cat ON cat.category_id = d.category_id
-        WHERE d.insert_user_id = ?
-
-        UNION ALL
-
-        SELECT 'comment' AS activity_type,
-               c.comment_id AS item_id,
-               c.discussion_id,
-               d.name AS discussion_name,
-               cat.name AS category_name,
-               c.date_inserted
-        FROM comments c
-        JOIN discussions d ON d.discussion_id = c.discussion_id
-        LEFT JOIN categories cat ON cat.category_id = d.category_id
-        WHERE c.insert_user_id = ?
-
-        ORDER BY date_inserted DESC, item_id DESC
-        LIMIT 20
-    """, [user_id, user_id])
 
     content = render_template_string(
         PROFILE_TEMPLATE,
         user=user,
-        activity=activity,
     )
     return base_template(f"{user['name']} - Forum Archive", content)
 

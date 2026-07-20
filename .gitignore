@@ -1,0 +1,5 @@
+*.db
+token.txt
+__pycache__
+avatars
+images

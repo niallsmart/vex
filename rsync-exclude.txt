@@ -1,0 +1,9 @@
+images
+avatars
+.venv
+.git
+node_modules
+*.db
+__pycache__
+
+*.swp

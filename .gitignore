@@ -3,3 +3,7 @@ token.txt
 __pycache__
 avatars
 images
+_site/
+_preview/
+._site-*/
+._preview-*/

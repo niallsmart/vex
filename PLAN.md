@@ -61,7 +61,7 @@ Use flat HTML files because CloudFront's Default Root Object applies only at the
 /avatar-placeholder.svg
 ```
 
-All generated navigation and rewritten post-body links use these canonical URLs. A comment permalink becomes the appropriate discussion page with its existing comment fragment; no HTML page is emitted for each of the 121,985 comments.
+All generated navigation and rewritten post-body links use absolute URLs formed by prefixing these canonical paths with a configurable base URL. The `Justfile` supplies an HTTPS hostname and defaults it to `d1b51nugwabl8z.cloudfront.net`. A comment permalink becomes the appropriate discussion page with its existing comment fragment; no HTML page is emitted for each of the 121,985 comments.
 
 The `.html` scheme intentionally does not preserve external bookmarks or search results that use the old Flask paths, including `/discussion/comment/{id}` and query-string pagination. Accepting those broken legacy links keeps the CloudFront deployment to a private S3 origin, a Default Root Object, and ordinary cache behaviors without an edge function or redirect-object layer.
 
@@ -78,7 +78,7 @@ Do not replace the current `rewrite_forum_links` behavior with a simpler URL sub
 
 Adapt the resolver to use the static `href_*` bindings. Resolve URL-decoded, name-only profile paths case-insensitively to a user ID, then emit the canonical `/profile/{user_id}.html` path. Precompute comment positions and per-discussion ordered comment metadata so comment IDs and dated `#latest` links can be resolved without an SQL query per anchor. Leave unrecognized source-domain links unchanged.
 
-Keep the current image behavior of stripping remote `srcset` attributes. Preload `{original_url: file_path}` once instead of performing one query per `src` attribute. Only rewrite an image URL when the referenced local file exists and its media type is accepted; otherwise retain the original URL. This prevents saved HTML error responses or missing files from becoming broken local image references.
+Keep the current image behavior of stripping remote `srcset` attributes. Preload `{original_url: file_path}` once instead of performing one query per `src` attribute. Treat a path-safe `images.file_path` with an accepted image media type as authoritative and rewrite it even when that file is absent from the build machine; deployments may build HTML against a partial local asset tree and upload the complete `images/` tree separately. Do not apply this assumption to arbitrary generated paths or avatars. Rows with unacceptable media types, including saved HTML error responses, retain their original URLs.
 
 ### 4. Write `vf_static.py`
 
@@ -90,13 +90,14 @@ Generate one profile page per user row. Match the current viewer's compact profi
 
 Build into a fresh sibling temporary directory, validate it, and replace the requested output directory. Never render over an old `_site`, because deleted discussions, changed page counts, and removed assets would survive both the local build and `aws s3 sync --delete`.
 
-Copy or hard-link `images/` and `avatars/` from the export without re-encoding. Prefer hard links when the source and staging directory share a filesystem so clean HTML rebuilds do not recopy 6.1 GB; fall back to `shutil.copy2` when linking is unavailable. Always construct the staged asset tree from the current export so removed files cannot linger. Write the fallback avatar SVG as `avatar-placeholder.svg`, and use it when an avatar row is absent, has a NULL path, references a missing file, or has an unacceptable media type.
+Symlink the export's `images/` and `avatars/` directories into the generated output. This makes asset staging immediate and avoids creating thousands of hard links or copying 6.1 GB, at the cost of making the local output dependent on the export directories remaining in place. S3 deployment must explicitly follow the symlinks. Write the fallback avatar SVG as `avatar-placeholder.svg`, and use it when an avatar row is absent, has a NULL path, references a missing file, or has an unacceptable media type.
 
 CLI reference:
 
 - `--db PATH` — SQLite export to read; defaults to `vanilla.db`. The file must already exist and is opened read-only.
 - `--output DIR` — destination site directory; defaults to `_site`. The generator builds in a fresh sibling staging directory and replaces this directory only after validation succeeds.
-- `--preview` — produce an intentionally incomplete build for local human testing. Generate the index and category pages, but restrict their discussion listings to the discussions selected with `--discussion`. Generate all pages of those discussions and the profiles referenced by them. Symlink the export's complete `images/` and `avatars/` directories into the preview output instead of staging their contents.
+- `--base-url URL` — absolute HTTP(S) origin used for generated internal links; defaults to `https://d1b51nugwabl8z.cloudfront.net`. The `Justfile` passes its `hostname` parameter as an HTTPS origin; direct invocations may use a local HTTP origin for testing.
+- `--preview` — produce an intentionally incomplete build for local human testing. Generate the index and category pages, but restrict their discussion listings to the discussions selected with `--discussion`. Generate all pages of those discussions and the profiles referenced by them.
 - `--discussion ID` — include one discussion in a preview build. The option is repeatable and is valid only with `--preview`; fail if an ID does not exist.
 - `-h`, `--help` — show usage and exit.
 
@@ -108,7 +109,7 @@ Use `export_meta.export_timestamp` in the footer and avoid wall-clock timestamps
 
 ### 5. Deploy with explicit metadata
 
-Keep the existing EC2 `sync` recipe in the `Justfile` so the Flask viewer can continue running in parallel when wanted. Add `build`, `preview`, `deploy`, and optionally `deploy-dry-run` recipes for the static site. Configure `preview` with a small maintained set of discussion IDs covering a short thread, an image-heavy thread, and a long paginated thread. Keep the bucket private behind CloudFront Origin Access Control; do not enable S3 website hosting.
+Keep the existing EC2 `sync` recipe in the `Justfile` so the Flask viewer can continue running in parallel when wanted. Add `build`, `preview`, `deploy`, and optionally `deploy-dry-run` recipes for the static site. Give build recipes a `hostname` parameter defaulting to `d1b51nugwabl8z.cloudfront.net`, and use it for every generated internal link. Configure `preview` with a small maintained set of discussion IDs covering a short thread, an image-heavy thread, and a long paginated thread. Keep the bucket private behind CloudFront Origin Access Control; do not enable S3 website hosting.
 
 Deployment must use separate, scoped sync operations:
 
@@ -131,7 +132,7 @@ Run a dry run before the first real upload. The first deployment transfers rough
 ## Verification
 
 1. Run `uv run python vf_static.py --db vanilla.db --output _site` and verify approximately 4,702 HTML pages, with the exact count derived from the database.
-2. Run the `preview` recipe and confirm it emits only the selected discussions, contains symlinked assets and `THIS_IS_A_PREVIEW`, and renders the maintained short, image-heavy, and paginated test cases correctly.
+2. Run the `preview` recipe and confirm it emits only the selected discussions, contains `THIS_IS_A_PREVIEW`, and renders the maintained short, image-heavy, and paginated test cases correctly.
 3. Confirm that `deploy` refuses the preview output.
 4. Prove full-build determinism by building twice from the same inputs and comparing file manifests and hashes.
 5. Serve `_site` locally and compare it against `just view`: index, category, profile, a thread's first and second pages, the 357-page thread's last page, a comment permalink target, a dated `#latest` link, local and failed-remote images, and missing-avatar fallback behavior.

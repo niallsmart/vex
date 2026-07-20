@@ -14,7 +14,7 @@ import argparse
 import re
 import sqlite3
 from datetime import datetime
-from html import unescape
+from html import escape, unescape
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from flask import Flask, g, render_template_string, abort, redirect, Response, request, send_file, url_for
@@ -22,6 +22,7 @@ from flask import Flask, g, render_template_string, abort, redirect, Response, r
 app = Flask(__name__)
 app.config['DATABASE'] = 'test.db'
 app.config['DATA_DIR'] = Path('.')  # Directory containing images/ and avatars/
+app.config['PUBLIC_URL'] = None
 
 
 # =============================================================================
@@ -87,7 +88,7 @@ def rewrite_images(html):
     return re.sub(r'src="([^"]+)"', replace_img, html)
 
 
-def resolve_forum_link(url):
+def resolve_forum_link(url, reference_date=None):
     """Map links from the retired Vanilla host into the local viewer."""
     parsed = urlsplit(unescape(url))
     if parsed.netloc and parsed.netloc.lower() != 'kissenacycling.vanillacommunity.com':
@@ -105,48 +106,89 @@ def resolve_forum_link(url):
 
     if len(path_parts) >= 3 and path_parts[:2] == ['discussion', 'comment']:
         if path_parts[2].isdigit():
-            return f'/discussion/comment/{path_parts[2]}'
+            return archive_url(f'/discussion/comment/{path_parts[2]}')
         return None
 
     if len(path_parts) >= 2 and path_parts[0] == 'discussion' and path_parts[1].isdigit():
         discussion_id = int(path_parts[1])
         comment_fragment = re.fullmatch(r'Comment_(\d+)', parsed.fragment, re.IGNORECASE)
         if comment_fragment:
-            return f'/discussion/comment/{comment_fragment.group(1)}'
+            return archive_url(f'/discussion/comment/{comment_fragment.group(1)}')
         if parsed.fragment.lower() == 'latest':
-            total_comments = query_db(
-                "SELECT COUNT(*) AS cnt FROM comments WHERE discussion_id = ?",
-                [discussion_id], one=True
-            )['cnt']
-            last_page = max(1, (total_comments + 29) // 30)
-            return f'/discussion/{discussion_id}?page={last_page}&per_page=30'
-        local = f'/discussion/{discussion_id}'
+            latest_comment = query_db("""
+                SELECT comment_id, date_inserted
+                FROM comments
+                WHERE discussion_id = ?
+                  AND (? IS NULL OR date_inserted <= ?)
+                ORDER BY date_inserted DESC, comment_id DESC
+                LIMIT 1
+            """, [discussion_id, reference_date, reference_date], one=True)
+            if not latest_comment:
+                return archive_url(f'/discussion/{discussion_id}')
+
+            comment_position = query_db("""
+                SELECT COUNT(*) AS cnt
+                FROM comments
+                WHERE discussion_id = ?
+                  AND (
+                      date_inserted < ?
+                      OR (date_inserted = ? AND comment_id <= ?)
+                  )
+            """, [
+                discussion_id,
+                latest_comment['date_inserted'],
+                latest_comment['date_inserted'],
+                latest_comment['comment_id'],
+            ], one=True)['cnt']
+            page = max(1, (comment_position + 29) // 30)
+            local = archive_url(
+                f'/discussion/{discussion_id}?page={page}&per_page=30'
+            )
+            return f'{local}#Comment_{latest_comment["comment_id"]}'
+        local = archive_url(f'/discussion/{discussion_id}')
         return f'{local}#{parsed.fragment}' if parsed.fragment else local
 
     return None
 
 
-def rewrite_forum_links(html):
+def archive_url(path):
+    """Build an absolute archive URL from configuration or the request host."""
+    base_url = app.config.get('PUBLIC_URL') or request.url_root
+    return f'{base_url.rstrip("/")}{path}'
+
+
+def rewrite_forum_links(html, reference_date=None):
     """Rewrite links embedded in exported post HTML."""
     if not html:
         return ''
 
-    def replace_link(match):
-        local = resolve_forum_link(match.group(3))
-        if local:
-            return f'{match.group(1)}{match.group(2)}{local}{match.group(2)}'
-        return match.group(0)
+    def replace_anchor(match):
+        original_url = match.group(3)
+        local = resolve_forum_link(original_url, reference_date)
+        if not local:
+            return match.group(0)
+
+        body = match.group(5)
+        if '<' not in body and unescape(body.strip()) == unescape(original_url):
+            leading_space = body[:len(body) - len(body.lstrip())]
+            trailing_space = body[len(body.rstrip()):]
+            body = f'{leading_space}{escape(local)}{trailing_space}'
+
+        return (
+            f'{match.group(1)}{match.group(2)}{escape(local, quote=True)}'
+            f'{match.group(2)}{match.group(4)}{body}</a>'
+        )
 
     return re.sub(
-        r'(href\s*=\s*)(["\x27])(.+?)\2',
-        replace_link,
+        r'(<a\b[^>]*?href\s*=\s*)(["\x27])(.+?)\2([^>]*>)(.*?)</a>',
+        replace_anchor,
         html,
-        flags=re.IGNORECASE,
+        flags=re.IGNORECASE | re.DOTALL,
     )
 
 
-def rewrite_content(html):
-    return rewrite_forum_links(rewrite_images(html))
+def rewrite_content(html, reference_date=None):
+    return rewrite_forum_links(rewrite_images(html), reference_date)
 
 
 app.jinja_env.filters['format_date'] = format_date
@@ -252,6 +294,8 @@ STYLES = """
     .post-avatar { width: 48px; height: 48px; border-radius: 50%; background: #ddd; object-fit: cover; }
     .post-author { flex-grow: 1; }
     .post-author-name { font-weight: 700; color: #0f1c3c; }
+    .post-author-name a { color: inherit; text-decoration: none; }
+    .post-author-name a:hover { color: #f78e1e; }
     .post-author-title { font-size: 12px; color: #777; }
     .post-date { font-size: 12px; color: #777; }
     .post-body { padding: 20px; }
@@ -264,6 +308,42 @@ STYLES = """
     .post-body pre, .post-body code { background: #f5f5f5; padding: 2px 6px; font-family: monospace; }
     .post-body pre { padding: 12px; overflow-x: auto; }
     .post.original-post { border-left: 4px solid #f78e1e; }
+    .profile-header {
+        background: white; padding: 28px; margin-bottom: 20px;
+        display: flex; align-items: center; gap: 24px;
+        border-left: 4px solid #f78e1e; box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    }
+    .profile-avatar {
+        width: 120px; height: 120px; border-radius: 50%; background: #ddd;
+        object-fit: cover; flex-shrink: 0;
+    }
+    .profile-identity { flex-grow: 1; min-width: 0; }
+    .profile-identity h1 {
+        color: #0f1c3c; font-size: 30px; font-weight: 400;
+        letter-spacing: 1px; overflow-wrap: anywhere;
+    }
+    .profile-title { color: #777; margin-top: 4px; }
+    .profile-joined { color: #777; font-size: 13px; margin-top: 8px; }
+    .profile-stats { display: flex; gap: 12px; margin-bottom: 20px; }
+    .profile-stat {
+        background: white; padding: 18px 24px; min-width: 150px;
+        text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    }
+    .profile-stat strong {
+        display: block; color: #0f1c3c; font-family: 'Oswald', sans-serif;
+        font-size: 24px; font-weight: 400;
+    }
+    .profile-stat span { color: #777; font-size: 12px; text-transform: uppercase; }
+    .profile-activity { background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    .profile-activity h2 {
+        padding: 16px 20px; color: #0f1c3c; font-size: 18px; font-weight: 400;
+        border-bottom: 1px solid #e5e5e5;
+    }
+    .activity-item { padding: 16px 20px; border-bottom: 1px solid #e5e5e5; }
+    .activity-item:last-child { border-bottom: none; }
+    .activity-item a { color: #0f1c3c; font-weight: 700; text-decoration: none; }
+    .activity-item a:hover { color: #f78e1e; }
+    .activity-meta { color: #777; font-size: 12px; margin-top: 3px; }
     .empty-state { text-align: center; padding: 60px 20px; color: #777; }
     .empty-state h2 { color: #0f1c3c; margin-bottom: 8px; }
     footer {
@@ -304,6 +384,13 @@ STYLES = """
     .pagination-options select {
         padding: 6px 10px; border: 1px solid #ddd;
         font-size: 14px; margin-left: 8px; cursor: pointer;
+    }
+    @media (max-width: 640px) {
+        .profile-header { align-items: flex-start; padding: 20px; }
+        .profile-avatar { width: 80px; height: 80px; }
+        .profile-identity h1 { font-size: 24px; }
+        .profile-stats { flex-direction: column; gap: 8px; }
+        .profile-stat { min-width: 0; }
     }
 </style>
 """
@@ -395,7 +482,12 @@ CATEGORY_TEMPLATE = """
                 <a href="/discussion/{{ disc.discussion_id }}">{{ disc.name }}</a>
             </div>
             <div class="discussion-meta">
-                Last reply by {{ disc.last_reply_name or 'Unknown' }}
+                Last reply by
+                {% if disc.avatar_user_id %}
+                <a href="{{ url_for('profile', user_id=disc.avatar_user_id, username=disc.last_reply_name) }}">{{ disc.last_reply_name or 'Unknown' }}</a>
+                {% else %}
+                {{ disc.last_reply_name or 'Unknown' }}
+                {% endif %}
                 &middot; {{ disc.last_activity_date | format_date }}
             </div>
         </div>
@@ -484,7 +576,7 @@ DISCUSSION_TEMPLATE = """
         {% if author %}
         <img class="post-avatar" src="/avatar/{{ author.user_id }}" alt="">
         <div class="post-author">
-            <div class="post-author-name">{{ author.name }}</div>
+            <div class="post-author-name"><a href="{{ url_for('profile', user_id=author.user_id, username=author.name) }}">{{ author.name }}</a></div>
             {% if author.title %}<div class="post-author-title">{{ author.title }}</div>{% endif %}
         </div>
         {% else %}
@@ -494,7 +586,7 @@ DISCUSSION_TEMPLATE = """
         <div class="post-date">{{ discussion.date_inserted | format_date }}</div>
     </div>
     <div class="post-body">
-        {{ discussion.body | rewrite_images | safe }}
+        {{ discussion.body | rewrite_images(discussion.date_inserted) | safe }}
     </div>
 </div>
 {% endif %}
@@ -505,7 +597,7 @@ DISCUSSION_TEMPLATE = """
         {% if comment.user_id %}
         <img class="post-avatar" src="/avatar/{{ comment.user_id }}" alt="">
         <div class="post-author">
-            <div class="post-author-name">{{ comment.user_name or 'Unknown' }}</div>
+            <div class="post-author-name"><a href="{{ url_for('profile', user_id=comment.user_id, username=comment.user_name) }}">{{ comment.user_name or 'Unknown' }}</a></div>
             {% if comment.user_title %}<div class="post-author-title">{{ comment.user_title }}</div>{% endif %}
         </div>
         {% else %}
@@ -515,12 +607,65 @@ DISCUSSION_TEMPLATE = """
         <div class="post-date">{{ comment.date_inserted | format_date }}</div>
     </div>
     <div class="post-body">
-        {{ comment.body | rewrite_images | safe }}
+        {{ comment.body | rewrite_images(comment.date_inserted) | safe }}
     </div>
 </div>
 {% endfor %}
 
 {{ pagination_controls() }}
+"""
+
+PROFILE_TEMPLATE = """
+<div class="breadcrumb">
+    <a href="/">Categories</a>
+    <span>&rsaquo;</span>
+    <strong>{{ user.name }}</strong>
+</div>
+
+<section class="profile-header">
+    <img class="profile-avatar" src="/avatar/{{ user.user_id }}" alt="{{ user.name }}'s avatar">
+    <div class="profile-identity">
+        <h1>{{ user.name }}</h1>
+        {% if user.title or user.label %}
+        <div class="profile-title">{{ user.title or user.label }}</div>
+        {% endif %}
+        {% if user.date_inserted %}
+        <div class="profile-joined">Joined {{ user.date_inserted | format_date }}</div>
+        {% endif %}
+    </div>
+</section>
+
+<div class="profile-stats" aria-label="Contribution counts">
+    <div class="profile-stat">
+        <strong>{{ user.count_discussions or 0 }}</strong>
+        <span>Discussions</span>
+    </div>
+    <div class="profile-stat">
+        <strong>{{ user.count_comments or 0 }}</strong>
+        <span>Comments</span>
+    </div>
+</div>
+
+<section class="profile-activity">
+    <h2>Recent activity</h2>
+    {% if activity %}
+        {% for item in activity %}
+        <div class="activity-item">
+            {% if item.activity_type == 'discussion' %}
+            Started <a href="/discussion/{{ item.discussion_id }}">{{ item.discussion_name }}</a>
+            {% else %}
+            Commented on <a href="/discussion/comment/{{ item.item_id }}">{{ item.discussion_name }}</a>
+            {% endif %}
+            {% if item.category_name %} in {{ item.category_name }}{% endif %}
+            <div class="activity-meta">{{ item.date_inserted | format_date }}</div>
+        </div>
+        {% endfor %}
+    {% else %}
+        <div class="empty-state">
+            <p>No archived activity for this user.</p>
+        </div>
+    {% endif %}
+</section>
 """
 
 
@@ -570,6 +715,55 @@ def category(category_id):
 
     content = render_template_string(CATEGORY_TEMPLATE, category=cat, discussions=discussions)
     return base_template(f"{cat['name']} - Forum Archive", content)
+
+
+@app.route('/profile/<int:user_id>')
+@app.route('/profile/<int:user_id>/<username>')
+def profile(user_id, username=None):
+    """Show a user's public profile and recent archived activity."""
+    user = query_db("""
+        SELECT user_id, name, title, label, date_inserted,
+               count_discussions, count_comments
+        FROM users
+        WHERE user_id = ?
+    """, [user_id], one=True)
+    if not user:
+        abort(404)
+
+    activity = query_db("""
+        SELECT 'discussion' AS activity_type,
+               d.discussion_id AS item_id,
+               d.discussion_id,
+               d.name AS discussion_name,
+               cat.name AS category_name,
+               d.date_inserted
+        FROM discussions d
+        LEFT JOIN categories cat ON cat.category_id = d.category_id
+        WHERE d.insert_user_id = ?
+
+        UNION ALL
+
+        SELECT 'comment' AS activity_type,
+               c.comment_id AS item_id,
+               c.discussion_id,
+               d.name AS discussion_name,
+               cat.name AS category_name,
+               c.date_inserted
+        FROM comments c
+        JOIN discussions d ON d.discussion_id = c.discussion_id
+        LEFT JOIN categories cat ON cat.category_id = d.category_id
+        WHERE c.insert_user_id = ?
+
+        ORDER BY date_inserted DESC, item_id DESC
+        LIMIT 20
+    """, [user_id, user_id])
+
+    content = render_template_string(
+        PROFILE_TEMPLATE,
+        user=user,
+        activity=activity,
+    )
+    return base_template(f"{user['name']} - Forum Archive", content)
 
 
 @app.route('/discussion/<int:discussion_id>')
@@ -713,12 +907,15 @@ def main():
     parser.add_argument('--db', default='test.db', help='SQLite database path (default: test.db)')
     parser.add_argument('--port', type=int, default=5000, help='Port to run on (default: 5000)')
     parser.add_argument('--host', default='127.0.0.1', help='Host to bind to (default: 127.0.0.1)')
+    parser.add_argument('--public-url',
+                        help='Public archive base URL used when rewriting embedded links')
 
     args = parser.parse_args()
 
     db_path = Path(args.db)
     app.config['DATABASE'] = args.db
     app.config['DATA_DIR'] = db_path.parent if db_path.parent != Path() else Path('.')
+    app.config['PUBLIC_URL'] = args.public_url
     print(f"Starting forum viewer at http://{args.host}:{args.port}")
     print(f"Database: {args.db}")
     print(f"Data directory: {app.config['DATA_DIR']}")

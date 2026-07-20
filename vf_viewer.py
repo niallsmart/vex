@@ -14,8 +14,10 @@ import argparse
 import re
 import sqlite3
 from datetime import datetime
+from html import unescape
 from pathlib import Path
-from flask import Flask, g, render_template_string, abort, Response, request, send_file
+from urllib.parse import parse_qs, urlsplit
+from flask import Flask, g, render_template_string, abort, redirect, Response, request, send_file, url_for
 
 app = Flask(__name__)
 app.config['DATABASE'] = 'test.db'
@@ -85,8 +87,70 @@ def rewrite_images(html):
     return re.sub(r'src="([^"]+)"', replace_img, html)
 
 
+def resolve_forum_link(url):
+    """Map links from the retired Vanilla host into the local viewer."""
+    parsed = urlsplit(unescape(url))
+    if parsed.netloc and parsed.netloc.lower() != 'kissenacycling.vanillacommunity.com':
+        return None
+    if not parsed.netloc and not parsed.path.startswith('/'):
+        return None
+
+    path_parts = [part for part in parsed.path.split('/') if part]
+
+    if path_parts[:2] == ['home', 'leaving']:
+        target = parse_qs(parsed.query).get('target', [None])[0]
+        if target and urlsplit(target).scheme in ('http', 'https'):
+            return target
+        return None
+
+    if len(path_parts) >= 3 and path_parts[:2] == ['discussion', 'comment']:
+        if path_parts[2].isdigit():
+            return f'/discussion/comment/{path_parts[2]}'
+        return None
+
+    if len(path_parts) >= 2 and path_parts[0] == 'discussion' and path_parts[1].isdigit():
+        discussion_id = int(path_parts[1])
+        comment_fragment = re.fullmatch(r'Comment_(\d+)', parsed.fragment, re.IGNORECASE)
+        if comment_fragment:
+            return f'/discussion/comment/{comment_fragment.group(1)}'
+        if parsed.fragment.lower() == 'latest':
+            total_comments = query_db(
+                "SELECT COUNT(*) AS cnt FROM comments WHERE discussion_id = ?",
+                [discussion_id], one=True
+            )['cnt']
+            last_page = max(1, (total_comments + 29) // 30)
+            return f'/discussion/{discussion_id}?page={last_page}&per_page=30'
+        local = f'/discussion/{discussion_id}'
+        return f'{local}#{parsed.fragment}' if parsed.fragment else local
+
+    return None
+
+
+def rewrite_forum_links(html):
+    """Rewrite links embedded in exported post HTML."""
+    if not html:
+        return ''
+
+    def replace_link(match):
+        local = resolve_forum_link(match.group(3))
+        if local:
+            return f'{match.group(1)}{match.group(2)}{local}{match.group(2)}'
+        return match.group(0)
+
+    return re.sub(
+        r'(href\s*=\s*)(["\x27])(.+?)\2',
+        replace_link,
+        html,
+        flags=re.IGNORECASE,
+    )
+
+
+def rewrite_content(html):
+    return rewrite_forum_links(rewrite_images(html))
+
+
 app.jinja_env.filters['format_date'] = format_date
-app.jinja_env.filters['rewrite_images'] = rewrite_images
+app.jinja_env.filters['rewrite_images'] = rewrite_content
 
 
 # =============================================================================
@@ -436,7 +500,7 @@ DISCUSSION_TEMPLATE = """
 {% endif %}
 
 {% for comment in comments %}
-<div class="post">
+<div class="post" id="Comment_{{ comment.comment_id }}">
     <div class="post-header">
         {% if comment.user_id %}
         <img class="post-avatar" src="/avatar/{{ comment.user_id }}" alt="">
@@ -541,7 +605,7 @@ def discussion(discussion_id):
         FROM comments c
         LEFT JOIN users u ON c.insert_user_id = u.user_id
         WHERE c.discussion_id = ?
-        ORDER BY c.date_inserted ASC
+        ORDER BY c.date_inserted ASC, c.comment_id ASC
         LIMIT {per_page} OFFSET {offset}
     """, [discussion_id])
 
@@ -558,6 +622,42 @@ def discussion(discussion_id):
         allowed_per_page=allowed_per_page
     )
     return base_template(f"{disc['name']} - Forum Archive", content)
+
+
+@app.route('/discussion/comment/<int:comment_id>', strict_slashes=False)
+def comment_permalink(comment_id):
+    """Redirect a Vanilla comment permalink to its paginated discussion."""
+    comment = query_db(
+        "SELECT discussion_id, date_inserted FROM comments WHERE comment_id = ?",
+        [comment_id], one=True
+    )
+    if not comment:
+        abort(404)
+
+    preceding_comments = query_db("""
+        SELECT COUNT(*) AS cnt
+        FROM comments
+        WHERE discussion_id = ?
+          AND (
+              date_inserted < ?
+              OR (date_inserted = ? AND comment_id < ?)
+          )
+    """, [
+        comment['discussion_id'],
+        comment['date_inserted'],
+        comment['date_inserted'],
+        comment_id,
+    ], one=True)['cnt']
+
+    per_page = 30
+    page = preceding_comments // per_page + 1
+    return redirect(url_for(
+        'discussion',
+        discussion_id=comment['discussion_id'],
+        page=page,
+        per_page=per_page,
+        _anchor=f'Comment_{comment_id}',
+    ))
 
 
 @app.route('/image/<int:image_id>')
